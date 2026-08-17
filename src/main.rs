@@ -1,107 +1,418 @@
+use axum::{
+    extract::State,
+    http::StatusCode,
+    response::{Html, IntoResponse},
+    routing::{get, post},
+    Json, Router,
+    routing::get_service,
+};
+use reqwest::Client;
+use serde::{Deserialize, Serialize};
+use serde_json::{json, Value};
+use std::{
+    collections::VecDeque, net::SocketAddr, sync::Arc, time::Duration,
+    process::{Command, Stdio, Child},
+    collections::HashMap,
+};
+use std::io::Write;
+use tokio::sync::Mutex;
+use sysinfo::{Networks, System, Disks};
+use tower_http::{
+    cors::{CorsLayer, Any},
+    services::ServeFile,
+};
+use sqlx::{Pool, Sqlite, SqlitePool, Row};
+use tracing_subscriber;
+
+// === Candle 相关 ===
 use candle_core::{quantized::gguf_file, Device, Tensor};
-use candle_examples::token_output_stream::TokenOutputStream;
-// 导入 Model 类型
 use candle_transformers::generation::{LogitsProcessor, Sampling};
-use std::{io::Write, path::PathBuf, str::FromStr};
-use tokenizers::Tokenizer;
-//千问量化模型
 use candle_transformers::models::quantized_qwen2::ModelWeights;
-use rand::prelude::*;
+use tokenizers::Tokenizer;
 use anyhow::Result;
+use candle_examples::token_output_stream::TokenOutputStream;
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let device = Device::cuda_if_available(0).unwrap_or(Device::Cpu);
-    println!("is_cuda={}", device.is_cuda());
+const SAMPLE_CAPACITY: usize = 60;
 
-    let (mut model, tokenizer) = get_model_and_tokenizer(
-        &device,
-        "F:/shixun/model-fast/qwen2.5-0.5b-instruct-q4_k_m.gguf",
-        "F:/shixun/model-fast/tokenizer.json",
-    )
-        .unwrap();
-    println!("model and tokenizer load ok");
-
-
-
-    // The seed to use when generating random samples.
-    // 不同的seed会导致不同的输出
-    let seed = rand::random_range(200_000_000..400_000_000);
-
-    let text_generation = TextGeneration::new(0.8, 1.1, 64, seed, None, None, false);
-
-
-    let token_ids =
-        get_prompt_tokens("我有一个苹果,一个橙子,一颗白菜 请给它们分类", &tokenizer).unwrap();
-    println!(
-        "{}",
-        text_generation
-            .generate(&token_ids, &mut model, &tokenizer, &device)
-            .unwrap()
-    );
-
-    println!("==========================================================");
-
-
-
-    let token_ids = get_prompt_tokens("'洋娃娃和小熊跳舞' 下一句是什么?", &tokenizer).unwrap();
-    println!(
-        "{}",
-        text_generation
-            .generate(&token_ids, &mut model, &tokenizer, &device)
-            .unwrap()
-    );
-
-
-    println!("==========================================================");
-
-    let prompt_str =
-        get_prompt_str("帮我发邮件给Tom, 内容是:有内鬼,交易终止! Tom的邮箱地址是: tom@example.com");
-    let token_ids = get_prompt_tokens(&prompt_str, &tokenizer).unwrap();
-    println!(
-        "{}",
-        text_generation
-            .generate(&token_ids, &mut model, &tokenizer, &device)
-            .unwrap()
-    );
-
-
-    println!("==========================================================");
-
-    let prompt_str =
-        get_prompt_str("帮我发短信给Tom, 内容是:有内鬼,交易终止! Tom的手机号是: 139000002222");
-    let token_ids = get_prompt_tokens(&prompt_str, &tokenizer).unwrap();
-    println!(
-        "{}",
-        text_generation
-            .generate(&token_ids, &mut model, &tokenizer, &device)
-            .unwrap()
-    );
-
-    println!("==========================================================");
-
-    Ok(())
+#[derive(Clone)]
+struct AppState {
+    client: Client,
+    llama_base: String,
+    metrics: Arc<Metrics>,
+    db: Pool<Sqlite>,
+    current_model: Arc<Mutex<Option<Child>>>,
+    model_paths: Arc<HashMap<String, String>>,
+    candle_models: Arc<HashMap<String, (String, String)>>,
+    loaded_candle: Arc<Mutex<Option<(ModelWeights, Tokenizer)>>>,
+    current_model_name: Arc<Mutex<Option<String>>>,
+    candle_model_loaded: Arc<Mutex<bool>>,
+    llama_model_loaded: Arc<Mutex<bool>>,
 }
 
-fn get_prompt_str(user_input: &str) -> String {
-    format!(
+struct Metrics {
+    cpu: Mutex<VecDeque<f32>>,
+    memory: Mutex<VecDeque<f32>>,
+    disk: Mutex<VecDeque<f32>>,
+    network: Mutex<VecDeque<f32>>,
+    prev_net_total: Mutex<u128>,
+}
+
+impl Metrics {
+    fn new() -> Self {
+        Self {
+            cpu: Mutex::new(VecDeque::with_capacity(SAMPLE_CAPACITY)),
+            memory: Mutex::new(VecDeque::with_capacity(SAMPLE_CAPACITY)),
+            disk: Mutex::new(VecDeque::with_capacity(SAMPLE_CAPACITY)),
+            network: Mutex::new(VecDeque::with_capacity(SAMPLE_CAPACITY)),
+            prev_net_total: Mutex::new(0),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+struct ChatRequest {
+    message: String,
+    model: String,
+    temperature: f32,
+    top_p: f32,
+    reset: Option<bool>,
+}
+
+#[derive(Deserialize)]
+struct LoadModelRequest {
+    model: String,
+}
+
+#[derive(Serialize)]
+struct HealthResponse {
+    status: String,
+    llama: String,
+    message: String,
+    candle: String,
+}
+
+#[tokio::main]
+async fn main() {
+    tracing_subscriber::fmt::init();
+
+    let mut model_paths = HashMap::new();
+    model_paths.insert("qwen3".to_string(), ".\\model\\qwen2.5-0.5b.gguf".to_string());
+    model_paths.insert("llama".to_string(), ".\\llama2\\llama-2-7b.gguf".to_string());
+
+    // ✅ Candle 模型路径表
+    let mut candle_models = HashMap::new();
+    candle_models.insert(
+        "qwen3-candle".to_string(),
+        (
+            ".\\model\\candle\\qwen3\\qwen3.gguf".to_string(),
+            ".\\model\\candle\\qwen3\\tokenizer.json".to_string(),
+        ),
+    );
+
+    // 初始化 SQLite
+    let db = SqlitePool::connect("sqlite://chat.db?mode=rwc").await.unwrap();
+    sqlx::query(
         r#"
-```
-{user_input}
-```
-你是一个AI助手, 可以帮我识别用户的意图, 请帮我识别上面的用户意图, 并帮我把关键信息整理下方样式的json格式:
-```
-{{
-    "action": "{{意图枚举}}",
-    "data": "{{关键信息}}"
-}}
-```
-意图枚举: send_email, tel_phone
-如果意图是send_email, 关键信息: {{ email: "xxx@xxxx", to_user: "xxx", message: "" }}
-如果意图是tel_phone, 关键信息: {{ phone: "139xxxxxx", message: "" }}
-    "#
-    )
+        CREATE TABLE IF NOT EXISTS chat_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        "#
+    ).execute(&db).await.unwrap();
+
+    let llama_base =
+        std::env::var("LLAMA_URL").unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+    let client = Client::builder()
+        .timeout(Duration::from_secs(300))
+        .build()
+        .unwrap();
+
+    let metrics = Arc::new(Metrics::new());
+    spawn_metrics_collector(metrics.clone());
+
+    let state = AppState {
+        client,
+        llama_base,
+        metrics,
+        db,
+        current_model: Arc::new(Mutex::new(None)),
+        model_paths: Arc::new(model_paths),
+        candle_models: Arc::new(candle_models),
+        loaded_candle: Arc::new(Mutex::new(None)),
+        current_model_name: Arc::new(Mutex::new(None)),
+        candle_model_loaded: Arc::new(Mutex::new(false)),
+        llama_model_loaded: Arc::new(Mutex::new(false)),
+    };
+
+    let static_files = ServeFile::new("./static/index.html");
+
+    let app = Router::new()
+        .route("/", get_service(static_files))
+        .route("/api/health", get(health_handler))
+        .route("/api/chat", post(chat_handler))
+        .route("/api/system_stats", get(system_stats_handler))
+        .route("/api/history", get(history_handler))
+        .route("/api/load_model", post(load_model_handler))
+        .with_state(state)
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        );
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:3002").await.unwrap();
+    println!("🚀 Rust LLM Service running at http://127.0.0.1:3002");
+    axum::serve(listener, app).await.unwrap();
+}
+// ---------------- Handlers ----------------
+
+async fn health_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let mut status = "ok".to_string();
+    let mut llama = "none".to_string();
+    let mut candle = "none".to_string();
+    let mut message = "No model loaded".to_string();
+
+    // 检查 Candle 是否加载
+    if *state.candle_model_loaded.lock().await {
+        candle = "candle_loaded".to_string();
+        message = "Candle 模型已加载".to_string();
+    }
+
+    // 检查 llama.cpp 服务
+    if *state.llama_model_loaded.lock().await {
+        match check_llama_health(&state.client, &state.llama_base).await {
+            Ok(true) => {
+                llama = "llama_loaded".to_string();
+                message = "llama.cpp 模型连接正常".to_string();
+            }
+            Ok(false) => {
+                llama = "loading_or_error".to_string();
+                message = "llama.cpp 未准备好".to_string();
+            }
+            Err(e) => {
+                llama = "unreachable".to_string();
+                message = format!("无法连接 llama.cpp: {}", e);
+            }
+        }
+    }
+    let res = HealthResponse { status, llama, candle, message };
+    (StatusCode::OK, Json(res))
 }
 
+
+async fn check_llama_health(client: &Client, base: &str) -> Result<bool, String> {
+    let url = format!("{}/health", base.trim_end_matches('/'));
+    match client.get(&url).send().await {
+        Ok(resp) => Ok(resp.status().is_success()),
+        Err(e) => Err(format!("{:?}", e)),
+    }
+}
+
+// 聊天（自动识别 candle/llama）
+async fn chat_handler(
+    State(state): State<AppState>,
+    Json(req): Json<ChatRequest>,
+) -> impl IntoResponse {
+    if req.reset.unwrap_or(false) {
+        sqlx::query("DELETE FROM chat_history").execute(&state.db).await.ok();
+        return (StatusCode::OK, Json(json!({"response": "[历史已清空]"})));
+    }
+
+    // 保存用户消息
+    sqlx::query("INSERT INTO chat_history (role, content) VALUES (?, ?)")
+        .bind("user")
+        .bind(&req.message)
+        .execute(&state.db)
+        .await
+        .ok();
+
+    // 检测是否是 candle 模型
+    if req.model.contains("candle") {
+        let mut lock = state.loaded_candle.lock().await;
+        let mut name = state.current_model_name.lock().await;
+        *name = Some(req.model.clone());
+        if let Some((model, tokenizer)) = &mut *lock {
+            let response = run_candle_inference(model, tokenizer, &req.message,req.temperature as f64,Some(req.top_p as f64))
+            .unwrap_or_else(|e| format!("Candle error: {e}"));
+            sqlx::query("INSERT INTO chat_history (role, content) VALUES (?, ?)")
+                .bind("assistant")
+                .bind(&response)
+                .execute(&state.db)
+                .await
+                .ok();
+            return (StatusCode::OK, Json(json!({ "response": response })));
+        } else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({"error": "Candle 模型未加载"})),
+            );
+        }
+    }
+
+    // llama.cpp 模型
+    let rows = sqlx::query("SELECT role, content FROM chat_history ORDER BY id DESC LIMIT 20")
+        .fetch_all(&state.db)
+        .await
+        .unwrap();
+
+    let history: Vec<Value> = rows
+        .into_iter()
+        .rev()
+        .map(|r| {
+            let role: String = r.get("role");
+            let content: String = r.get("content");
+            json!({"role": role, "content": content})
+        })
+        .collect();
+
+    let target = format!("{}/v1/chat/completions", state.llama_base.trim_end_matches('/'));
+    let payload = json!({
+        "model": req.model,
+        "messages": history,
+        "temperature": req.temperature,
+        "top_p": req.top_p
+    });
+
+    match state.client.post(&target).json(&payload).send().await {
+        Ok(resp) => {
+            if !resp.status().is_success() {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    Json(json!({"error": format!("llama returned {}", resp.status())})),
+                );
+            }
+            let v: Value = resp.json().await.unwrap_or(json!({}));
+            let reply = v["choices"]
+                .get(0)
+                .and_then(|c| c["message"]["content"].as_str())
+                .unwrap_or("[无返回]")
+                .to_string();
+
+            sqlx::query("INSERT INTO chat_history (role, content) VALUES (?, ?)")
+                .bind("assistant")
+                .bind(&reply)
+                .execute(&state.db)
+                .await
+                .ok();
+
+            (StatusCode::OK, Json(json!({ "response": reply })))
+        }
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({"error": format!("cannot reach llama-server: {}", e)})),
+        ),
+    }
+}
+
+// 加载模型（支持 llama-server 与 Candle）
+async fn load_model_handler(
+    State(state): State<AppState>,
+    Json(req): Json<LoadModelRequest>,
+) -> impl IntoResponse {
+    // 1️⃣ 如果是 Candle 模型
+    if req.model.contains("candle") {
+        let Some((model_path, tokenizer_path)) = state.candle_models.get(&req.model) else {
+            return (StatusCode::BAD_REQUEST, Json(json!({"status": "error", "error": "未知 Candle 模型"})));
+        };
+        println!("🧠 正在加载 Candle 模型: {}", req.model);
+
+        match load_candle_model(model_path, tokenizer_path) {
+            Ok((model, tokenizer)) => {
+                let mut guard = state.loaded_candle.lock().await;
+                *guard = Some((model, tokenizer));
+                *state.candle_model_loaded.lock().await = true;
+                return (StatusCode::OK, Json(json!({"status": "ok", "model": req.model})));
+            }
+            Err(e) => {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(json!({"status": "error", "error": e.to_string()})),
+                );
+            }
+        }
+    }
+
+    // 2️⃣ llama.cpp 模型
+    let Some(path) = state.model_paths.get(&req.model) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({"status": "error", "error": "未知模型"})),
+        );
+    };
+
+    // 关闭旧进程
+    {
+        let mut guard = state.current_model.lock().await;
+        if let Some(child) = guard.as_mut() {
+            #[cfg(target_os = "windows")]
+            {
+                let _ = Command::new("taskkill")
+                    .args(&["/PID", &child.id().to_string(), "/F"])
+                    .output();
+            }
+            let _ = child.kill();
+            *guard = None;
+            *state.llama_model_loaded.lock().await = false;
+        }
+    }
+
+    // 启动新进程
+    let exe = ".\\model\\llama\\llama-server.exe";
+    match Command::new(exe)
+        .args(&["-m", path])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        Ok(child) => {
+            let mut guard = state.current_model.lock().await;
+            *guard = Some(child);
+            *state.llama_model_loaded.lock().await = true;
+            (StatusCode::OK, Json(json!({"status": "ok", "model": req.model})))
+        }
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"status": "error", "error": e.to_string()})),
+        ),
+    }
+}
+
+// ---------------- Candle 相关函数 ----------------
+fn load_candle_model(model_path: &str, tokenizer_path: &str) -> Result<(ModelWeights, Tokenizer)> {
+    let device = Device::Cpu;
+    let mut model_file = std::fs::File::open(model_path)?;
+    let model_data = gguf_file::Content::read(&mut model_file).map_err(|e| e.with_path(model_path))?;
+    let model = ModelWeights::from_gguf(model_data, &mut model_file, &device)?;
+    let tokenizer = Tokenizer::from_file(tokenizer_path).map_err(|e| anyhow::anyhow!("{e}"))?;
+    Ok((model, tokenizer))
+}
+
+fn run_candle_inference(model: &mut ModelWeights, tokenizer: &Tokenizer, prompt: &str,temperature: f64, top_p: Option<f64>) -> anyhow::Result<String> {
+    // 固定 prompt 模板
+    let formatted_prompt = format!(
+        "<|im_start|>system\n你是一个友好的 AI 助手，回答要简洁自然。\n<|im_end|>\n\
+         <|im_start|>user\n{}\n<|im_end|>\n\
+         <|im_start|>assistant\n",
+        prompt
+    );
+
+    // 编码
+    let prompt_tokens = tokenizer.encode(formatted_prompt, true)
+        .map_err(|e| anyhow::anyhow!("Tokenizer encode error: {e}"))?;
+    let input_tokens = prompt_tokens.get_ids();
+
+    // text generation
+    let seed = rand::random_range(200_000_000..400_000_000);
+    let text_generation = TextGeneration::new(temperature, 1.1, 64, seed, top_p, None, false);
+
+    // 执行生成
+    let result = text_generation.generate(input_tokens, model, tokenizer, &Device::Cpu)?;
+
+    Ok(result)
+}
 struct TextGeneration {
     temperature: f64,
 
@@ -229,58 +540,115 @@ impl TextGeneration {
     }
 }
 
-fn get_prompt_tokens(prompt_str: &str, tokenizer: &Tokenizer) -> anyhow::Result<Vec<u32>> {
-    let prompt_str = format!(
-        "<|im_start|>user\n{}<|im_end|>\n<|im_start|>assistant\n",
-        prompt_str
-    );
-    print!("formatted instruct prompt: {}", &prompt_str);
+// ---------------- Metrics collector & helpers ----------------
 
-    let prompt_tokens = tokenizer.encode(prompt_str, true).unwrap();
+fn spawn_metrics_collector(metrics: Arc<Metrics>) {
+    tokio::spawn(async move {
+        let mut sys = System::new_all();
+        let mut interval = tokio::time::interval(Duration::from_secs(5));
+        let mut net = Networks::new();
+        let mut disks = Disks::new();
+        loop {
+            interval.tick().await;
 
-    Ok(prompt_tokens.get_ids().to_vec())
-}
+            // 刷新数据
+            sys.refresh_cpu_usage();
+            sys.refresh_memory();
+            disks.refresh(false);
+            net.refresh(false);
 
-fn get_model_and_tokenizer(
-    device: &Device,
-    model_path: &str,
-    tokenizer_path: &str,
-) -> anyhow::Result<(ModelWeights, Tokenizer)> {
-    // 读取 GGUF 模型文件
-    let model_path = PathBuf::from_str(model_path).unwrap();
-    let mut model_file = std::fs::File::open(&model_path)?;
+            // CPU 使用率（sys.global_cpu_usage() 返回 f32）
+            let cpu_pct = sys.global_cpu_usage();
 
-    let model = {
-        let model =
-            gguf_file::Content::read(&mut model_file).map_err(|e| e.with_path(model_path))?;
-        let mut total_size_in_bytes = 0;
-        for (_, tensor) in model.tensor_infos.iter() {
-            let elem_count = tensor.shape.elem_count();
-            total_size_in_bytes +=
-                elem_count * tensor.ggml_dtype.type_size() / tensor.ggml_dtype.block_size();
+            // 内存使用率
+            let total_mem = sys.total_memory() as f32;
+            let used_mem = (sys.total_memory() - sys.available_memory()) as f32;
+            let mem_pct = if total_mem > 0.0 {
+                used_mem / total_mem * 100.0
+            } else {
+                0.0
+            };
+
+            // 磁盘使用率（汇总所有磁盘）
+            let mut total_space: u128 = 0;
+            let mut avail_space: u128 = 0;
+            for disk in disks.iter() {
+                total_space += disk.total_space() as u128;
+                avail_space += disk.available_space() as u128;
+            }
+            let disk_pct = if total_space > 0 {
+                (total_space - avail_space) as f32 / total_space as f32 * 100.0
+            } else {
+                0.0
+            };
+
+            // 网络流量（累计接收 + 发送），计算近 5 秒带宽（bytes/sec -> Mbps）
+            let mut net_total: u128 = 0;
+            for (_name, data) in net.list() {
+                net_total += (data.received() as u128) + (data.transmitted() as u128);
+            }
+            let mut prev = metrics.prev_net_total.lock().await;
+            let delta = net_total.saturating_sub(*prev);
+            *prev = net_total;
+            drop(prev);
+
+            let bytes_per_sec = (delta as f64) / 5.0;
+            let mbps = (bytes_per_sec * 8.0) / (1024.0 * 1024.0);
+            // 归一化为 0..100 的百分比表示（以 1000 Mbps 为 100% 的参考值）
+            let net_pct = ((mbps / 1000.0) * 100.0).min(100.0) as f32;
+
+            // push 到环形缓冲
+            push(&metrics.cpu, cpu_pct).await;
+            push(&metrics.memory, mem_pct).await;
+            push(&metrics.disk, disk_pct).await;
+            push(&metrics.network, net_pct).await;
         }
-        println!(
-            "loaded {:?} tensors ({}) ",
-            model.tensor_infos.len(),
-            &format_size(total_size_in_bytes),
-        );
-        ModelWeights::from_gguf(model, &mut model_file, &device)?
-    };
-
-    // 创建 Tokenizer
-    let tokenizer = Tokenizer::from_file(tokenizer_path).unwrap();
-
-    Ok((model, tokenizer))
+    });
 }
 
-fn format_size(size_in_bytes: usize) -> String {
-    if size_in_bytes < 1_000 {
-        format!("{}B", size_in_bytes)
-    } else if size_in_bytes < 1_000_000 {
-        format!("{:.2}KB", size_in_bytes as f64 / 1e3)
-    } else if size_in_bytes < 1_000_000_000 {
-        format!("{:.2}MB", size_in_bytes as f64 / 1e6)
-    } else {
-        format!("{:.2}GB", size_in_bytes as f64 / 1e9)
+/// helper: 将新样本压入 VecDeque（保证容量）
+async fn push(m: &Mutex<VecDeque<f32>>, val: f32) {
+    let mut dq = m.lock().await;
+    if dq.len() >= SAMPLE_CAPACITY {
+        dq.pop_front();
     }
+    // 保持两位小数
+    dq.push_back((val * 100.0).round() / 100.0);
+}
+// ---------------- system_stats_handler ----------------
+
+async fn system_stats_handler(State(state): State<AppState>) -> impl IntoResponse {
+    let cpu = state.metrics.cpu.lock().await.clone().into_iter().collect::<Vec<_>>();
+    let memory = state.metrics.memory.lock().await.clone().into_iter().collect::<Vec<_>>();
+    let disk = state.metrics.disk.lock().await.clone().into_iter().collect::<Vec<_>>();
+    let network = state.metrics.network.lock().await.clone().into_iter().collect::<Vec<_>>();
+
+    let body = json!({
+        "cpu": cpu,
+        "memory": memory,
+        "disk": disk,
+        "network": network,
+    });
+    (StatusCode::OK, Json(body))
+}
+// ---------------- history_handler ----------------
+
+async fn history_handler(State(state): State<AppState>) -> impl IntoResponse {
+    // 查询最近 20 条（按 id 倒序，最后再反转成正序，保证显示从旧到新）
+    let rows = sqlx::query("SELECT role, content FROM chat_history ORDER BY id DESC LIMIT 20")
+        .fetch_all(&state.db)
+        .await
+        .unwrap_or_default();
+
+    let history: Vec<Value> = rows
+        .into_iter()
+        .rev()
+        .map(|r| {
+            let role: String = r.get("role");
+            let content: String = r.get("content");
+            json!({ "role": role, "content": content })
+        })
+        .collect();
+
+    (StatusCode::OK, Json(history))
 }
